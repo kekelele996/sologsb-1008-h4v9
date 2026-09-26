@@ -68,3 +68,30 @@ export interface DiffToken {
   type: "same" | "add" | "remove";
   value: string;
 }
+
+export type ImportRowStatus = "applied" | "awaiting" | "discarded" | "error";
+
+export interface ImportRow {
+  id: string;
+  code: string;
+  language: string;
+  targetText: string;
+  reviewer: string;
+  status: ImportRowStatus;
+  reason?: string;
+  signId?: string;
+  previousText?: string;
+  createdAt: string;
+  resolvedAt?: string;
+}
+
+export interface ImportBatch {
+  id: string;
+  createdAt: string;
+  rows: ImportRow[];
+}
+
+export interface PersistedImports {
+  schema: 1;
+  batches: ImportBatch[];
+}

@@ -1,11 +1,19 @@
 import { $, component$, useSignal, useVisibleTask$, type QRL } from "@builder.io/qwik";
 import { type DocumentHead } from "@builder.io/qwik-city";
 import { createSeedProject, STATUS_LABELS, uid } from "../data";
-import type { ReviewStatus, SignItem, SignProject } from "../types";
+import type { ImportBatch, ImportRow, ReviewStatus, SignItem, SignProject } from "../types";
 import { analyzeSign, cloneTerms, diffText } from "../utils";
 
 const STORAGE_KEY = "sologsb-1008-project-v1";
+const IMPORT_KEY = "sologsb-1008-imports-v1";
 const WIDTHS = [320, 480, 720, 960] as const;
+
+const IMPORT_ROW_STATUS_LABELS: Record<ImportRow["status"], string> = {
+  applied: "已采用",
+  awaiting: "待处理",
+  discarded: "已放弃",
+  error: "未匹配",
+};
 
 export const head: DocumentHead = {
   title: "公共标识多语言校对台",
@@ -38,6 +46,10 @@ export default component$(() => {
   const toast = useSignal("");
   const previewId = useSignal("");
   const readOnly = useSignal(false);
+  const batches = useSignal<ImportBatch[]>([]);
+  const importOpen = useSignal(false);
+  const importDraft = useSignal("");
+  const discardDrafts = useSignal<Record<string, string>>({});
   const active = () => project.value.signs.find((sign) => sign.id === (previewId.value || project.value.activeSignId)) ?? project.value.signs[0];
 
   const commit = $((label: string, update: (draft: SignProject) => void) => {
@@ -174,6 +186,183 @@ export default component$(() => {
     toast.value = "只读预览链接已复制";
   });
 
+  const pendingImportCount = () =>
+    batches.value.reduce(
+      (count, batch) => count + batch.rows.filter((row) => row.status === "awaiting" || row.status === "error").length,
+      0,
+    );
+
+  const parseImport = $(() => {
+    const source = importDraft.value.trim();
+    if (!source) return;
+    const rows: ImportRow[] = [];
+    const directApplies: { signId: string; targetText: string }[] = [];
+    const seenSignIds = new Set<string>();
+    const alreadyAwaiting = new Set(
+      batches.value.flatMap((batch) => batch.rows).filter((row) => row.status === "awaiting").map((row) => row.signId),
+    );
+    for (const line of source.split(/\r?\n/)) {
+      if (!line.trim()) continue;
+      let fields = line.split("\t").map((field) => field.trim());
+      if (fields.length < 4) {
+        const byComma = line.split(/[,，]/).map((field) => field.trim());
+        if (byComma.length > fields.length) fields = byComma;
+      }
+      const row: ImportRow = {
+        id: uid("row"),
+        code: fields[0] ?? "",
+        language: fields[1] ?? "",
+        targetText: fields.length >= 4 ? fields.slice(2, -1).join(" ").trim() : "",
+        reviewer: fields.length >= 4 ? fields[fields.length - 1] : "",
+        status: "error",
+        createdAt: new Date().toISOString(),
+      };
+      if (fields.length < 4) {
+        row.reason = "字段不足：每行需要 编号、目标语言、译文、审校人 四列（Tab 分隔）";
+        rows.push(row);
+        continue;
+      }
+      const missing: string[] = [];
+      if (!row.code) missing.push("标识编号");
+      if (!row.language) missing.push("目标语言");
+      if (!row.targetText) missing.push("译文");
+      if (!row.reviewer) missing.push("审校人");
+      if (missing.length) {
+        row.reason = `缺少${missing.join("、")}`;
+        rows.push(row);
+        continue;
+      }
+      const sign = project.value.signs.find((item) => item.code.trim().toLowerCase() === row.code.toLowerCase());
+      if (!sign) {
+        row.reason = `编号 ${row.code} 不存在`;
+        rows.push(row);
+        continue;
+      }
+      if (sign.targetLanguage.trim().toLowerCase() !== row.language.toLowerCase()) {
+        row.reason = `语言不匹配：${sign.code} 的目标语言为 ${sign.targetLanguage}`;
+        rows.push(row);
+        continue;
+      }
+      if (seenSignIds.has(sign.id)) {
+        row.reason = "本批次中该编号重复";
+        rows.push(row);
+        continue;
+      }
+      seenSignIds.add(sign.id);
+      row.signId = sign.id;
+      row.previousText = sign.targetText;
+      if (sign.status === "confirmed") {
+        if (alreadyAwaiting.has(sign.id)) {
+          row.reason = "该标识已有待处理的导入记录";
+          rows.push(row);
+          continue;
+        }
+        row.status = "awaiting";
+      } else {
+        row.status = "applied";
+        row.resolvedAt = new Date().toISOString();
+        directApplies.push({ signId: sign.id, targetText: row.targetText });
+      }
+      rows.push(row);
+    }
+    if (!rows.length) return;
+    if (directApplies.length) {
+      commit("批量导入译文", (draft) => {
+        for (const applied of directApplies) {
+          const sign = draft.signs.find((item) => item.id === applied.signId);
+          if (!sign) continue;
+          sign.targetText = applied.targetText;
+          sign.status = sign.emergencyRevision ? "changes" : "pending";
+          sign.updatedAt = new Date().toISOString();
+        }
+      });
+    }
+    batches.value = [{ id: uid("batch"), createdAt: new Date().toISOString(), rows }, ...batches.value];
+    importDraft.value = "";
+    const applied = rows.filter((row) => row.status === "applied").length;
+    const awaiting = rows.filter((row) => row.status === "awaiting").length;
+    const errors = rows.filter((row) => row.status === "error").length;
+    toast.value = `已采用 ${applied} 条，${awaiting} 条待处理，${errors} 条未匹配`;
+  });
+
+  const adoptRow = $((batchId: string, rowId: string) => {
+    const row = batches.value.find((batch) => batch.id === batchId)?.rows.find((item) => item.id === rowId);
+    if (!row?.signId || row.status !== "awaiting") return;
+    const reviewer = row.reviewer;
+    const targetText = row.targetText;
+    const signId = row.signId;
+    commit("采用批量导入译文", (draft) => {
+      const sign = draft.signs.find((item) => item.id === signId);
+      if (!sign) return;
+      sign.versions.unshift({
+        id: uid("version"),
+        label: `导入前快照 · ${reviewer}`,
+        createdAt: new Date().toISOString(),
+        sourceText: sign.sourceText,
+        targetText: sign.targetText,
+        status: sign.status,
+        terms: cloneTerms(sign.terms),
+      });
+      sign.versions = sign.versions.slice(0, 12);
+      sign.targetText = targetText;
+      sign.status = "pending";
+      sign.updatedAt = new Date().toISOString();
+      sign.comments.unshift({
+        id: uid("comment"),
+        author: reviewer,
+        body: "批量导入新译文，原文已存档为版本快照，标识退回待确认。",
+        createdAt: new Date().toISOString(),
+        resolved: false,
+        replies: [],
+      });
+    });
+    batches.value = batches.value.map((batch) =>
+      batch.id === batchId
+        ? { ...batch, rows: batch.rows.map((item) => (item.id === rowId ? { ...item, status: "applied" as const, resolvedAt: new Date().toISOString() } : item)) }
+        : batch,
+    );
+    toast.value = "已采用新译文并生成版本快照";
+  });
+
+  const discardRow = $((batchId: string, rowId: string) => {
+    const reason = (discardDrafts.value[rowId] ?? "").trim();
+    if (!reason) {
+      toast.value = "放弃前请填写原因";
+      return;
+    }
+    batches.value = batches.value.map((batch) =>
+      batch.id === batchId
+        ? { ...batch, rows: batch.rows.map((item) => (item.id === rowId ? { ...item, status: "discarded" as const, reason, resolvedAt: new Date().toISOString() } : item)) }
+        : batch,
+    );
+    const drafts = { ...discardDrafts.value };
+    delete drafts[rowId];
+    discardDrafts.value = drafts;
+    toast.value = "已放弃该行并记录原因";
+  });
+
+  const removeRow = $((batchId: string, rowId: string) => {
+    batches.value = batches.value
+      .map((batch) => (batch.id === batchId ? { ...batch, rows: batch.rows.filter((item) => item.id !== rowId) } : batch))
+      .filter((batch) => batch.rows.length > 0);
+  });
+
+  const clearResolvedImports = $(() => {
+    batches.value = batches.value
+      .map((batch) => ({ ...batch, rows: batch.rows.filter((row) => row.status === "awaiting" || row.status === "error") }))
+      .filter((batch) => batch.rows.length > 0);
+  });
+
+  const fillImportSample = $(() => {
+    importDraft.value = [
+      "TR-01\tEnglish\tWaiting Area. Please queue behind the yellow line and keep your belongings with you.\t王敏",
+      "EM-02\tEnglish\tEMERGENCY EXIT. In an emergency, leave quickly in the direction shown. Do not use the elevator.\t李工",
+      "SV-03\t日本語\t飲料水。茶殻や果物の皮などを流さないでください。\t佐藤",
+      "PR-07\tEnglish\tNo Smoking. Including e-cigarettes.\t王敏",
+      "XX-99\tEnglish\tStaff Only\t王敏",
+    ].join("\n");
+  });
+
   const preview = () => analyzeSign(active(), previewWidth.value, previewFont.value);
   const selectedVersion = () => active().versions.find((version) => version.id === selectedVersionId.value) ?? active().versions[0];
   const comparison = () => {
@@ -187,6 +376,8 @@ export default component$(() => {
       try {
         const stored = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "") as { schema: number; project: SignProject };
         if (stored.schema === 1 && stored.project?.signs?.length) project.value = stored.project;
+        const storedImports = JSON.parse(localStorage.getItem(IMPORT_KEY) ?? "null") as { schema: number; batches: ImportBatch[] } | null;
+        if (storedImports?.schema === 1 && Array.isArray(storedImports.batches)) batches.value = storedImports.batches;
         const requestedPreview = new URLSearchParams(window.location.search).get("preview") ?? "";
         previewId.value = requestedPreview;
         readOnly.value = Boolean(requestedPreview);
@@ -207,10 +398,24 @@ export default component$(() => {
     cleanup(() => window.clearTimeout(timer));
   });
 
+  useVisibleTask$(({ track, cleanup }) => {
+    track(() => hydrated.value);
+    if (!hydrated.value) return;
+    track(() => batches.value);
+    const timer = window.setTimeout(() => {
+      localStorage.setItem(IMPORT_KEY, JSON.stringify({ schema: 1, batches: batches.value }));
+    }, 450);
+    cleanup(() => window.clearTimeout(timer));
+  });
+
   useVisibleTask$(({ cleanup }) => {
     const updateOnline = () => { online.value = navigator.onLine; };
     updateOnline();
     const keydown = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && importOpen.value) {
+        importOpen.value = false;
+        return;
+      }
       const target = event.target as HTMLElement | null;
       if (target?.matches("input, textarea, select, [contenteditable='true']")) return;
       const command = event.metaKey || event.ctrlKey;
@@ -292,6 +497,10 @@ export default component$(() => {
         </div>
         <div class="navbar-end gap-2">
           <span class={`badge ${online.value ? "badge-success" : "badge-warning"} badge-outline`}>{online.value ? "在线" : "离线草稿"}</span>
+          <button class="btn btn-sm border-white/20 bg-white/10 text-white hover:bg-white/20" onClick$={() => importOpen.value = true}>
+            批量导入
+            {pendingImportCount() > 0 && <span class="badge badge-error badge-sm">{pendingImportCount()}</span>}
+          </button>
           <button class="btn btn-ghost btn-sm" disabled={!past.value.length} onClick$={undo}>撤销</button>
           <button class="btn btn-ghost btn-sm" disabled={!future.value.length} onClick$={redo}>重做</button>
           <button class="btn btn-sm border-white/20 bg-white/10 text-white hover:bg-white/20" onClick$={sharePreview}>复制只读链接</button>
@@ -314,6 +523,11 @@ export default component$(() => {
             <div class="text-xs font-bold uppercase tracking-[0.16em] text-slate-400">标识清单</div>
             <div class="mt-1 text-lg font-bold text-slate-800">{project.value.signs.length} 处标识</div>
             <p class="mt-1 text-xs leading-5 text-slate-500">{project.value.location}</p>
+            {pendingImportCount() > 0 && (
+              <button class="btn btn-error btn-xs mt-2 w-full" onClick$={() => importOpen.value = true}>
+                未处理导入 {pendingImportCount()} 条
+              </button>
+            )}
           </div>
           <div class="space-y-2">
             {project.value.signs.map((sign, index) => {
@@ -551,6 +765,108 @@ export default component$(() => {
           </section>
         </aside>
       </div>
+
+      {importOpen.value && (
+        <div class="modal modal-open">
+          <div class="modal-box max-w-4xl">
+            <div class="flex items-start justify-between">
+              <div>
+                <h2 class="text-lg font-bold">批量导入译文</h2>
+                <p class="mt-1 text-xs text-slate-500">
+                  每行一条：标识编号、目标语言、译文、审校人，以 Tab 分隔（可直接从表格软件粘贴）。编号或语言对不上的行会保留并标注原因，其余行照常处理。
+                </p>
+              </div>
+              <button class="btn btn-ghost btn-sm" onClick$={() => importOpen.value = false}>关闭</button>
+            </div>
+            <textarea
+              class="textarea textarea-bordered mt-3 min-h-28 w-full font-mono text-xs leading-6"
+              placeholder={"TR-01\tEnglish\tWaiting Area. Please queue behind the yellow line.\t王敏"}
+              value={importDraft.value}
+              onInput$={(_, element) => importDraft.value = element.value}
+            />
+            <div class="mt-2 flex items-center justify-between">
+              <button class="btn btn-ghost btn-xs" onClick$={fillImportSample}>填入示例</button>
+              <div class="flex gap-2">
+                {batches.value.some((batch) => batch.rows.some((row) => row.status === "applied" || row.status === "discarded")) && (
+                  <button class="btn btn-ghost btn-sm" onClick$={clearResolvedImports}>清除已处理记录</button>
+                )}
+                <button class="btn btn-primary btn-sm" disabled={!importDraft.value.trim()} onClick$={parseImport}>解析并导入</button>
+              </div>
+            </div>
+
+            <div class="mt-4 max-h-[52vh] space-y-4 overflow-y-auto pr-1">
+              {batches.value.length === 0 && (
+                <div class="rounded-xl border border-dashed p-6 text-center text-sm text-slate-400">还没有导入记录。待处理记录会保存在本浏览器，重新打开后仍在。</div>
+              )}
+              {batches.value.map((batch) => (
+                <section key={batch.id} class="rounded-xl border border-slate-200">
+                  <header class="flex items-center justify-between border-b border-slate-100 bg-slate-50 px-3 py-2 text-xs text-slate-500">
+                    <span class="font-bold">批次 {new Date(batch.createdAt).toLocaleString()}</span>
+                    <span>{batch.rows.length} 行 · 待处理 {batch.rows.filter((row) => row.status === "awaiting" || row.status === "error").length}</span>
+                  </header>
+                  <ul class="divide-y divide-slate-100">
+                    {batch.rows.map((row) => {
+                      const sign = row.signId ? project.value.signs.find((item) => item.id === row.signId) : undefined;
+                      return (
+                        <li key={row.id} class="px-3 py-2">
+                          <div class="flex items-center justify-between gap-3">
+                            <div class="flex min-w-0 items-center gap-2 text-xs">
+                              <span class="font-mono font-bold">{row.code || "（空编号）"}</span>
+                              <span class="badge badge-ghost badge-sm">{row.language || "未填语言"}</span>
+                              <span class="text-slate-500">审校人：{row.reviewer || "未填"}</span>
+                            </div>
+                            <div class="flex items-center gap-2">
+                              <span class={`badge badge-sm ${row.status === "applied" ? "badge-success" : row.status === "awaiting" ? "badge-warning" : row.status === "discarded" ? "badge-neutral" : "badge-error"}`}>
+                                {IMPORT_ROW_STATUS_LABELS[row.status]}
+                              </span>
+                              {row.status === "error" && (
+                                <button class="btn btn-ghost btn-xs" onClick$={() => removeRow(batch.id, row.id)}>移除</button>
+                              )}
+                            </div>
+                          </div>
+                          {row.status === "error" && <p class="mt-1 text-xs font-semibold text-error">{row.reason}</p>}
+                          {row.status === "discarded" && <p class="mt-1 text-xs text-slate-500">放弃原因：{row.reason}</p>}
+                          {row.status === "applied" && <p class="mt-1 line-clamp-2 whitespace-pre-line text-xs text-slate-600">{row.targetText}</p>}
+                          {row.status === "awaiting" && sign && (
+                            <div class="mt-2 rounded-lg bg-slate-50 p-3">
+                              <div class="grid grid-cols-2 gap-3 text-xs">
+                                <div>
+                                  <div class="mb-1 font-bold text-slate-500">当前译文（已确认）</div>
+                                  <p class="whitespace-pre-line rounded bg-white p-2 leading-6">{sign.targetText}</p>
+                                </div>
+                                <div>
+                                  <div class="mb-1 font-bold text-blue-600">新译文（{row.reviewer}）</div>
+                                  <p class="whitespace-pre-line rounded bg-white p-2 leading-6">{row.targetText}</p>
+                                </div>
+                              </div>
+                              <div class="mt-2 rounded-lg bg-slate-900 p-2 text-xs leading-6 text-slate-100">
+                                {diffText(sign.targetText, row.targetText).map((token, index) => (
+                                  <span key={index} class={token.type === "add" ? "rounded bg-green-400/25 text-green-200" : token.type === "remove" ? "bg-red-400/25 text-red-200 line-through" : ""}>{token.value}</span>
+                                ))}
+                              </div>
+                              <div class="mt-2 flex flex-wrap items-center gap-2">
+                                <button class="btn btn-primary btn-xs" onClick$={() => adoptRow(batch.id, row.id)}>采用（存档快照并退回待确认）</button>
+                                <input
+                                  class="input input-xs input-bordered flex-1"
+                                  placeholder="放弃原因（必填）"
+                                  value={discardDrafts.value[row.id] ?? ""}
+                                  onInput$={(_, element) => discardDrafts.value = { ...discardDrafts.value, [row.id]: element.value }}
+                                />
+                                <button class="btn btn-outline btn-error btn-xs" disabled={!(discardDrafts.value[row.id] ?? "").trim()} onClick$={() => discardRow(batch.id, row.id)}>放弃</button>
+                              </div>
+                            </div>
+                          )}
+                        </li>
+                      );
+                    })}
+                  </ul>
+                </section>
+              ))}
+            </div>
+          </div>
+          <div class="modal-backdrop" onClick$={() => importOpen.value = false}></div>
+        </div>
+      )}
 
       {toast.value && <div class="toast toast-end z-50"><div class="alert alert-success"><span>{toast.value}</span></div></div>}
     </div>
