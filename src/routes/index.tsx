@@ -1,5 +1,6 @@
 import { $, component$, useSignal, useVisibleTask$, type QRL } from "@builder.io/qwik";
 import { type DocumentHead } from "@builder.io/qwik-city";
+import BulkImportModal from "../components/bulk-import/bulk-import";
 import { createSeedProject, STATUS_LABELS, uid } from "../data";
 import type { ReviewStatus, SignItem, SignProject } from "../types";
 import { analyzeSign, cloneTerms, diffText } from "../utils";
@@ -38,7 +39,9 @@ export default component$(() => {
   const toast = useSignal("");
   const previewId = useSignal("");
   const readOnly = useSignal(false);
+  const bulkOpen = useSignal(false);
   const active = () => project.value.signs.find((sign) => sign.id === (previewId.value || project.value.activeSignId)) ?? project.value.signs[0];
+  const pendingBulkCount = () => project.value.bulkImports.filter((entry) => entry.state === "awaiting" || entry.state === "invalid").length;
 
   const commit = $((label: string, update: (draft: SignProject) => void) => {
     past.value = [...past.value.slice(-49), structuredClone(project.value)];
@@ -174,6 +177,12 @@ export default component$(() => {
     toast.value = "只读预览链接已复制";
   });
 
+  const locateSign: QRL<(signId: string) => void> = $((signId: string) => {
+    commit("定位回传标识", (draft) => { draft.activeSignId = signId; });
+    bulkOpen.value = false;
+    selectedVersionId.value = "";
+  });
+
   const preview = () => analyzeSign(active(), previewWidth.value, previewFont.value);
   const selectedVersion = () => active().versions.find((version) => version.id === selectedVersionId.value) ?? active().versions[0];
   const comparison = () => {
@@ -186,7 +195,10 @@ export default component$(() => {
     if (!hydrated.value) {
       try {
         const stored = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "") as { schema: number; project: SignProject };
-        if (stored.schema === 1 && stored.project?.signs?.length) project.value = stored.project;
+        if (stored.schema === 1 && stored.project?.signs?.length) {
+          stored.project.bulkImports ??= [];
+          project.value = stored.project;
+        }
         const requestedPreview = new URLSearchParams(window.location.search).get("preview") ?? "";
         previewId.value = requestedPreview;
         readOnly.value = Boolean(requestedPreview);
@@ -292,6 +304,10 @@ export default component$(() => {
         </div>
         <div class="navbar-end gap-2">
           <span class={`badge ${online.value ? "badge-success" : "badge-warning"} badge-outline`}>{online.value ? "在线" : "离线草稿"}</span>
+          <button class="btn btn-sm border-white/20 bg-white/10 text-white hover:bg-white/20" onClick$={() => (bulkOpen.value = true)}>
+            表格回传
+            {pendingBulkCount() > 0 && <span class="badge badge-sm badge-error">{pendingBulkCount()}</span>}
+          </button>
           <button class="btn btn-ghost btn-sm" disabled={!past.value.length} onClick$={undo}>撤销</button>
           <button class="btn btn-ghost btn-sm" disabled={!future.value.length} onClick$={redo}>重做</button>
           <button class="btn btn-sm border-white/20 bg-white/10 text-white hover:bg-white/20" onClick$={sharePreview}>复制只读链接</button>
@@ -312,12 +328,21 @@ export default component$(() => {
         <aside class="overflow-y-auto bg-slate-50 p-3">
           <div class="mb-3 rounded-xl bg-white p-4 shadow-sm">
             <div class="text-xs font-bold uppercase tracking-[0.16em] text-slate-400">标识清单</div>
-            <div class="mt-1 text-lg font-bold text-slate-800">{project.value.signs.length} 处标识</div>
+            <div class="mt-1 flex items-center justify-between">
+              <div class="text-lg font-bold text-slate-800">{project.value.signs.length} 处标识</div>
+              {pendingBulkCount() > 0 && (
+                <span class="badge badge-sm badge-error gap-1" title="表格回传待处理（对不上或已确认待比对）">
+                  <svg xmlns="http://www.w3.org/2000/svg" class="h-3 w-3" viewBox="0 0 20 20" fill="currentColor"><path d="M10 2a6 6 0 00-6 6v3.586l-.707.707A1 1 0 004 14h12a1 1 0 00.707-1.707L16 11.586V8a6 6 0 00-6-6zM10 18a3 3 0 01-3-3h6a3 3 0 01-3 3z"/></svg>
+                  {pendingBulkCount()} 未处理
+                </span>
+              )}
+            </div>
             <p class="mt-1 text-xs leading-5 text-slate-500">{project.value.location}</p>
           </div>
           <div class="space-y-2">
             {project.value.signs.map((sign, index) => {
               const risk = analyzeSign(sign, previewWidth.value, previewFont.value);
+              const hasPendingBulk = project.value.bulkImports.some((entry) => entry.signId === sign.id && entry.state === "awaiting");
               return (
                 <button
                   key={sign.id}
@@ -328,7 +353,10 @@ export default component$(() => {
                   }}
                 >
                   <div class="flex items-center justify-between">
-                    <span class="font-mono text-xs font-bold text-slate-500">{sign.code}</span>
+                    <span class="font-mono text-xs font-bold text-slate-500">
+                      {sign.code}
+                      {hasPendingBulk && <span class="ml-1 inline-block h-2 w-2 rounded-full bg-error align-middle" title="有回传译文待比对"></span>}
+                    </span>
                     <span class={`badge badge-sm ${statusClass(sign.status)}`}>{STATUS_LABELS[sign.status]}</span>
                   </div>
                   <div class="mt-2 line-clamp-2 text-sm font-semibold text-slate-700">{sign.sourceText}</div>
@@ -395,7 +423,11 @@ export default component$(() => {
                 </label>
                 <div class="divider my-0"></div>
                 <div class="flex items-center justify-between">
-                  <div><div class="text-xs font-bold uppercase tracking-[0.16em] text-blue-500">Target</div><h2 class="font-bold">目标语言译文</h2></div>
+                  <div>
+                    <div class="text-xs font-bold uppercase tracking-[0.16em] text-blue-500">Target</div>
+                    <h2 class="font-bold">目标语言译文</h2>
+                    {active().bulkReviewer && <p class="mt-0.5 text-[11px] text-slate-400">最近表格回传审校人：{active().bulkReviewer}</p>}
+                  </div>
                   <button class="btn btn-sm btn-outline" onClick$={saveVersion}>保存版本快照</button>
                 </div>
                 <textarea
@@ -529,8 +561,9 @@ export default component$(() => {
                 {active().versions.length ? (
                   <>
                     <select class="select select-sm select-bordered mt-3 w-full" value={selectedVersionId.value || active().versions[0].id} onChange$={(_, element) => selectedVersionId.value = element.value}>
-                      {active().versions.map((version) => <option key={version.id} value={version.id}>{`${version.label} · ${new Date(version.createdAt).toLocaleTimeString()}`}</option>)}
+                      {active().versions.map((version) => <option key={version.id} value={version.id}>{`${version.label} · ${new Date(version.createdAt).toLocaleTimeString()}${version.reviewer ? ` · ${version.reviewer}` : ""}`}</option>)}
                     </select>
+                    {selectedVersion()?.note && <p class="mt-1 text-[11px] text-slate-400">{selectedVersion()!.note}</p>}
                     <div class="mt-3 rounded-lg bg-slate-900 p-3 text-sm leading-7 text-slate-100">
                       {comparison().map((token, index) => (
                         <span key={index} class={token.type === "add" ? "rounded bg-green-400/25 text-green-200" : token.type === "remove" ? "bg-red-400/25 text-red-200 line-through" : ""}>{token.value}</span>
@@ -553,6 +586,14 @@ export default component$(() => {
       </div>
 
       {toast.value && <div class="toast toast-end z-50"><div class="alert alert-success"><span>{toast.value}</span></div></div>}
+
+      <BulkImportModal
+        open={bulkOpen}
+        project={project}
+        commit={commit}
+        onLocate={locateSign}
+        onToast={$((message: string) => { toast.value = message; })}
+      />
     </div>
   );
 });

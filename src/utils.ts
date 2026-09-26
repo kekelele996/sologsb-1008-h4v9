@@ -104,3 +104,37 @@ export function diffText(oldText: string, newText: string): DiffToken[] {
 export function cloneTerms(terms: TermBinding[]) {
   return structuredClone(terms);
 }
+
+export interface BulkParsedRow {
+  row: number;
+  cells: string[];
+  code: string;
+  language: string;
+  targetText: string;
+  reviewer: string;
+}
+
+/**
+ * 解析粘贴的表格内容（TSV，兼容多空格分隔的简单情形）。
+ * 每个物理行对应一条回传记录；空行跳过，首行识别为表头时跳过。
+ */
+export function parseBulkTsv(input: string): BulkParsedRow[] {
+  const rows: BulkParsedRow[] = [];
+  const lines = input.replace(/\r\n?/g, "\n").split("\n");
+  lines.forEach((line, index) => {
+    if (!line.trim()) return;
+    const cells = line.split("\t").map((cell) => cell.trim());
+    rows.push({
+      row: index + 1,
+      cells,
+      code: cells[0] ?? "",
+      language: cells[1] ?? "",
+      targetText: cells[2] ?? "",
+      reviewer: cells[3] ?? "",
+    });
+  });
+  if (rows.length && /编号|code/i.test(rows[0].code) && /语言|language/i.test(rows[0].language)) {
+    rows.shift();
+  }
+  return rows;
+}
